@@ -1,0 +1,8 @@
+src/
+tests/
+examples/
+.eslintrc.cjs
+.prettierrc
+tsconfig.json
+tsconfig.build.json
+*.tsbuildinfo
