@@ -381,6 +381,7 @@ export class StateMachine {
       session.completenessExtensions = 0;
       this.messageTimestamps.set(senderId, []);
       this.startSilenceTimer(senderId);
+      this.startMaxListenTimer(senderId); // Restart silence-exit timer
       this.ctx.logger.info(`Response sent for ${senderId}, staying in listen mode`);
     } else {
       // Fully exit listen mode
@@ -393,11 +394,16 @@ export class StateMachine {
     const session = this.getSession(senderId);
     const now = Date.now();
 
-    // If currently in RESPONDING mode (delivery in progress), cancel and handle new message
+    // If currently in RESPONDING mode (AI is generating/delivering response),
+    // buffer the new message and keep listening — don't reset the session.
+    // The stayInMode block in triggerResponse will handle the transition back to LISTENING.
     if (session.mode === ListenState.RESPONDING) {
-      this.deliveryQueue.cancel(senderId);
-      this.resetSession(senderId);
-      // Fall through to process as new message in NORMAL mode
+      this.buffer.push(senderId, message);
+      session.lastMessageTime = now;
+      session.lastMessageIsVoice = message.type === 'voice';
+      session.lastMessageText = content;
+      this.ctx.logger.info(`Message received during RESPONDING for ${senderId}, buffered for next round`);
+      return 'handled';
     }
 
     if (session.mode === ListenState.NORMAL) {
