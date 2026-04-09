@@ -198,7 +198,6 @@ export type {
   PersonaConfigOptions,
   SessionConfigOptions,
   StatsConfigOptions,
-  ResponseMode,
 } from './types/config.js';
 export type {
   InboundMessage,
