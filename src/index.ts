@@ -10,8 +10,6 @@ export { ListenModePlugin } from './plugin.js';
 //   → runEmbeddedPiAgent (OpenClaw pipeline: session + memory)
 //   → extract reply → send via channel API
 
-import { ListenModePlugin } from './plugin.js';
-
 // ─── Types ───
 
 interface PluginApi {
@@ -50,20 +48,6 @@ interface SenderState {
   abortController: AbortController | null;
   judgeAbort: AbortController | null;
   state: 'idle' | 'buffering' | 'waiting' | 'triggering';
-}
-
-interface DispatchEvent {
-  content?: string;
-  senderId?: string;
-  sessionKey?: string;
-  channel?: string;
-  isGroup?: boolean;
-  timestamp?: number;
-}
-
-interface HookContext {
-  senderId?: string;
-  sessionKey?: string;
 }
 
 // ─── Config ───
