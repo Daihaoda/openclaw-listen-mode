@@ -69,4 +69,6 @@ export const DEFAULT_CONFIG: ListenModeConfig = {
     maxExtensions: 2,
     extensionMs: 7000,
   },
+  responseMode: 'debounce',
+  debounceMs: 2000,
 };

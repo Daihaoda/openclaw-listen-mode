@@ -32,6 +32,8 @@ export const completenessCheckSchema = z.object({
   extensionMs: z.number().positive(),
 });
 
+export const responseModeSchema = z.enum(['debounce', 'batch']);
+
 export const listenModeConfigSchema = z.object({
   triggerMode: z.enum(['manual', 'auto', 'both']),
   silenceTimeoutMs: z.number().positive(),

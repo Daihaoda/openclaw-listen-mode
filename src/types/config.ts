@@ -70,6 +70,9 @@ export interface StatsConfigOptions {
   storagePath: string;
 }
 
+/** Response mode */
+export type ResponseMode = 'debounce' | 'batch';
+
 /** Phase 4: LLM completeness check config */
 export interface CompletenessCheckConfig {
   enabled: boolean;
@@ -99,6 +102,10 @@ export interface ListenModeConfig {
   session: SessionConfigOptions;
   stats: StatsConfigOptions;
   completenessCheck: CompletenessCheckConfig;
+  /** Response mode: 'debounce' (fast, cancel on new msg) or 'batch' (wait for silence) */
+  responseMode: ResponseMode;
+  /** Debounce delay in ms (only used in debounce mode) */
+  debounceMs: number;
 }
 
 export type DeepPartial<T> = {

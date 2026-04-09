@@ -21,6 +21,8 @@ export interface SessionState {
   lastMessageIsVoice: boolean;
   lastMessageText: string;
   completenessExtensions: number;
+  /** True when last AI response was aborted (user sent new message during generation) */
+  lastResponseAborted: boolean;
 }
 
 export type TriggerType = 'manual' | 'auto';

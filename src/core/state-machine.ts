@@ -39,6 +39,7 @@ export class StateMachine {
   private readonly sessionManager?: ListenSessionManager;
   private readonly statsCollector?: StatsCollector;
   private readonly completenessConfig: CompletenessCheckConfig;
+  private abortControllers = new Map<string, AbortController>();
   readonly analytics: AnalyticsEmitter;
 
   constructor(
@@ -79,6 +80,7 @@ export class StateMachine {
         lastMessageIsVoice: false,
         lastMessageText: '',
         completenessExtensions: 0,
+        lastResponseAborted: false,
       };
       this.sessions.set(senderId, session);
     }
@@ -107,10 +109,18 @@ export class StateMachine {
       session.lastMessageIsVoice = false;
       session.lastMessageText = '';
       session.completenessExtensions = 0;
+      session.lastResponseAborted = false;
     }
+    this.abortControllers.get(senderId)?.abort();
+    this.abortControllers.delete(senderId);
   }
 
   private getSilenceTimeout(senderId: string): number {
+    // Debounce mode: fixed short timeout
+    if (this.config.responseMode === 'debounce') {
+      return this.config.debounceMs;
+    }
+    // Batch mode: dynamic or static timeout
     const session = this.getSession(senderId);
     if (this.config.dynamicTimeout.enabled) {
       const timestamps = this.messageTimestamps.get(senderId);
@@ -157,9 +167,10 @@ export class StateMachine {
     const session = this.getSession(senderId);
     if (session.mode !== ListenState.LISTENING) return;
 
-    // ─── LLM completeness gate ───
+    // ─── LLM completeness gate (batch mode only) ───
     const cc = this.completenessConfig;
     if (
+      this.config.responseMode !== 'debounce' &&
       cc.enabled &&
       session.completenessExtensions < cc.maxExtensions &&
       this.buffer.count(senderId) > 0
@@ -291,11 +302,14 @@ export class StateMachine {
     this.silenceTimers.get(senderId)?.clear();
     this.maxListenTimers.get(senderId)?.clear();
 
-    // Flush buffer and merge
-    const messages = this.buffer.flush(senderId);
+    // Read buffer without flushing (debounce mode keeps buffer until success)
+    const isDebounce = this.config.responseMode === 'debounce';
+    const messages = isDebounce
+      ? this.buffer.getRecent(senderId, this.config.maxBufferMessages)
+      : this.buffer.flush(senderId);
+
     if (messages.length === 0) {
       if (stayInMode) {
-        // Empty buffer but staying in listen mode — just keep waiting
         session.mode = ListenState.LISTENING;
         this.startSilenceTimer(senderId);
         this.ctx.logger.info(`Empty buffer for ${senderId}, staying in listen mode`);
@@ -330,13 +344,21 @@ export class StateMachine {
     if (sessionContext) {
       merged += sessionContext + '\n';
     }
+    // If last response was aborted, inject hint so AI knows to re-respond
+    if (session.lastResponseAborted) {
+      const abortHint = session.detectedLanguage === 'zh'
+        ? '[上一轮回复未送达用户（用户在回复生成期间发了新消息）。请基于以下所有消息重新回复。]\n\n'
+        : '[Previous response was not delivered (user sent new messages during generation). Please respond to all messages below.]\n\n';
+      merged += abortHint;
+      session.lastResponseAborted = false;
+    }
     merged += mergeMessages(messages, session.detectedLanguage, this.config.systemHint);
     if (emotionSuffix) {
       merged += emotionSuffix;
     }
 
     this.ctx.logger.info(
-      `Triggering response for sender ${senderId} with ${messages.length} messages (emotion: ${emotionScore.level})`,
+      `Triggering response for sender ${senderId} with ${messages.length} messages (emotion: ${emotionScore.level}, mode: ${this.config.responseMode})`,
     );
 
     // Record stats
@@ -352,9 +374,20 @@ export class StateMachine {
       responseTriggered: true,
     });
 
-    // Send to Agent
+    // Send to Agent (with abort support in debounce mode)
+    const controller = new AbortController();
+    this.abortControllers.set(senderId, controller);
+
     try {
-      const agentReply = await this.ctx.sendToAgent(senderId, merged);
+      const agentReply = await this.ctx.sendToAgent(senderId, merged, {
+        signal: controller.signal,
+      });
+
+      // Check if aborted after await (race condition)
+      if (controller.signal.aborted) {
+        this.ctx.logger.info(`Agent reply received but aborted for ${senderId}, discarding`);
+        return;
+      }
 
       // Record AI response for session context
       this.sessionManager?.recordAiResponse(senderId, agentReply);
@@ -367,8 +400,19 @@ export class StateMachine {
       } else {
         await this.ctx.sendToUser(senderId, agentReply);
       }
-    } catch (e) {
+
+      // Success — now clear the buffer (debounce mode kept it until now)
+      if (isDebounce) {
+        this.buffer.clear(senderId);
+      }
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === 'AbortError') {
+        this.ctx.logger.info(`Agent call aborted for ${senderId} (user sent new message)`);
+        return; // Don't clear buffer, don't reset — handleInbound already set LISTENING
+      }
       this.ctx.logger.error(`Failed to get agent response for sender ${senderId}`, e);
+    } finally {
+      this.abortControllers.delete(senderId);
     }
 
     if (stayInMode) {
@@ -394,15 +438,29 @@ export class StateMachine {
     const session = this.getSession(senderId);
     const now = Date.now();
 
-    // If currently in RESPONDING mode (AI is generating/delivering response),
-    // buffer the new message and keep listening — don't reset the session.
-    // The stayInMode block in triggerResponse will handle the transition back to LISTENING.
+    // If currently in RESPONDING mode (AI is generating/delivering response)
     if (session.mode === ListenState.RESPONDING) {
-      this.buffer.push(senderId, message);
-      session.lastMessageTime = now;
-      session.lastMessageIsVoice = message.type === 'voice';
-      session.lastMessageText = content;
-      this.ctx.logger.info(`Message received during RESPONDING for ${senderId}, buffered for next round`);
+      if (this.config.responseMode === 'debounce') {
+        // Debounce mode: abort current AI call, buffer message, restart debounce
+        this.abortControllers.get(senderId)?.abort();
+        this.deliveryQueue.cancel(senderId);
+        session.lastResponseAborted = true;
+        this.buffer.push(senderId, message);
+        session.lastMessageTime = now;
+        session.lastMessageIsVoice = message.type === 'voice';
+        session.lastMessageText = content;
+        session.mode = ListenState.LISTENING;
+        this.startSilenceTimer(senderId);
+        this.startMaxListenTimer(senderId);
+        this.ctx.logger.info(`Debounce: aborted AI call, restarting for ${senderId}`);
+      } else {
+        // Batch mode: just buffer, let triggerResponse finish
+        this.buffer.push(senderId, message);
+        session.lastMessageTime = now;
+        session.lastMessageIsVoice = message.type === 'voice';
+        session.lastMessageText = content;
+        this.ctx.logger.info(`Batch: buffered during RESPONDING for ${senderId}`);
+      }
       return 'handled';
     }
 
@@ -561,6 +619,10 @@ export class StateMachine {
     this.maxListenTimers.clear();
     this.buffer.clearAll();
     this.deliveryQueue.cancelAll();
+    for (const [, controller] of this.abortControllers) {
+      controller.abort();
+    }
+    this.abortControllers.clear();
     this.sessions.clear();
   }
 }

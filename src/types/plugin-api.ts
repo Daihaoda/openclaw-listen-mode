@@ -14,6 +14,8 @@ export interface SendOptions {
 
 export interface SendToAgentOptions {
   systemHint?: string;
+  /** AbortSignal for cancelling the agent call */
+  signal?: AbortSignal;
 }
 
 export interface LLMCallOptions {
