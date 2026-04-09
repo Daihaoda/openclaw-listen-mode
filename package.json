@@ -1,7 +1,7 @@
 {
   "name": "@im_dd/openclaw-listen-mode",
   "version": "2.0.2",
-  "description": "OpenClaw plugin for empathic listening mode in chat",
+  "description": "OpenClaw plugin that buffers rapid messages and responds once with full context — supports Telegram, WeChat, and more",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -27,8 +27,11 @@
     "plugin",
     "listen-mode",
     "empathy",
+    "telegram",
     "wechat",
-    "chat"
+    "chat",
+    "debounce",
+    "semantic-judge"
   ],
   "license": "MIT",
   "openclaw": {
