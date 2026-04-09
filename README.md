@@ -8,39 +8,102 @@
 
 ## What is this?
 
-When users vent to an AI chatbot, the AI typically responds after every single message. This creates an awkward, interrupted experience — like talking to someone who keeps cutting you off.
+When users send multiple messages to an AI chatbot, the AI typically responds after every single message. This creates an interrupted experience — the AI starts answering before hearing the full story.
 
-**Listen Mode** fixes this. When activated, the AI:
+**Listen Mode** fixes this. The plugin:
 
-1. **Shuts up** and lets the user talk
-2. **Buffers** all messages during the silence
-3. **Waits** intelligently (dynamic timeout based on punctuation, typing speed, message length)
-4. **Responds** with a single, comprehensive empathic reply that addresses everything the user said
+1. **Intercepts** all incoming messages via OpenClaw's `before_dispatch` hook
+2. **Buffers** messages with a 2-second debounce window
+3. **Judges** completeness using a parallel LLM call (DONE/WAIT semantic analysis)
+4. **Responds** once with full context via `runEmbeddedPiAgent` (OpenClaw pipeline)
 
 ```
-User: 我朋友跟我说了件事
-User: 她男朋友劈腿了
-User: 被她闺蜜发现的
-User: 然后她男朋友还死不承认
-AI:   (listening... 🎧)
-User: 她现在特别难过
-AI:   天呐这也太过分了吧... 被闺蜜发现的还死不承认，你朋友现在肯定又气又伤心
-      <<<SPLIT>>>
-      她现在怎么样了？有没有人陪着她
+User: My friend broke up
+User: Her boyfriend cheated
+User: Her bestie found out
+AI:   (waits for all messages...)
+AI:   That's terrible... cheated AND got caught by her bestie.
+      How is she doing? Is someone with her?
 ```
 
-## Features
+## Architecture (v3)
 
-- **State Machine**: `NORMAL → LISTENING → RESPONDING` with stay-in-mode support
-- **Dynamic Silence Timeout**: Rule-based 4-layer calculation — punctuation, message length, typing speed, voice detection
-- **LLM Completeness Check**: Asks a lightweight LLM "has the user finished talking?" before responding
-- **Emotion-Aware Acks**: 6 emotion categories (anger, sadness, anxiety, helpless, gossip, rant) with keyword classification
-- **Silence-Based Exit**: 5 minutes of no messages → warm farewell → exit (resets on every message)
-- **Intent Classification**: LLM-based task/vent/chat classification with keyword fallback
-- **Multi-Round Sessions**: Responds but stays in listen mode — user's conversation is continuous
-- **Persona System**: Switchable personas with preset and custom definitions
-- **i18n**: Chinese and English support
-- **135 Tests**: Comprehensive unit and integration test coverage
+```
+User sends message
+  |
+  v
+before_dispatch hook intercepts
+  -> { handled: true } blocks default AI response
+  -> message enters buffer
+  -> 2s debounce timer starts
+  -> parallel semantic judge (DONE/WAIT) via LLM
+  |
+  |-- DONE: trigger AI immediately
+  |-- WAIT: extend timer by 3s
+  |-- timeout/error: fallback to debounce
+  |
+  v (timer expires)
+runEmbeddedPiAgent (full OpenClaw pipeline)
+  -> session history preserved
+  -> memory-tdai (long-term memory)
+  -> prompt build (system prompt + context)
+  -> LLM call
+  -> memory capture
+  |
+  v
+AI reply delivered to user
+  -> via agent's message tool (primary)
+  -> via channel Bot API (fallback)
+```
+
+### Abort on New Message
+
+If the user sends another message while AI is generating:
+
+```
+User: message1 -> AI starts generating...
+User: message2 -> AbortController cancels AI call
+                -> buffer keeps message1 + message2
+                -> re-trigger AI with all messages
+```
+
+### Semantic Judge
+
+A parallel LLM call determines if the user has finished their thought:
+
+| Buffer | Judgment | Reason |
+|--------|----------|--------|
+| "I want to tell you something" | WAIT | Opening statement, more coming |
+| "Write me an email to my boss saying I'm sick tomorrow" | DONE | Complete request |
+| "My friend broke up" | WAIT | Story just starting |
+| "How's the weather?" | DONE | Complete question |
+
+The judge runs in parallel with the debounce timer. If it returns before the timer, it can either trigger AI early (DONE) or extend the wait (WAIT). On timeout or error, the original debounce behavior is preserved.
+
+### Duplicate Detection
+
+Skips identical consecutive messages from the same sender (OpenClaw's Telegram polling sometimes dispatches the same batch twice).
+
+## Platform Support
+
+| Platform | Intercept | AI Pipeline | Reply Delivery | Status |
+|----------|-----------|-------------|----------------|--------|
+| Telegram | api.on('before_dispatch') | runEmbeddedPiAgent | message tool + Bot API fallback | Verified |
+| WeChat | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Architecture ready |
+| Discord | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Architecture ready |
+| Slack | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Architecture ready |
+
+The core logic is platform-agnostic. Only the reply delivery step needs per-channel adaptation.
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Cold start | ~80-120s (first message, session + memory init) |
+| Warm response | 8-19s (subsequent messages) |
+| Debounce window | 2s |
+| Judge timeout | 3s |
+| WAIT extension | +3s |
 
 ## Install
 
@@ -48,195 +111,48 @@ AI:   天呐这也太过分了吧... 被闺蜜发现的还死不承认，你朋�
 npm install @im_dd/openclaw-listen-mode
 ```
 
-## Quick Start
-
-```typescript
-import { ListenModePlugin } from '@im_dd/openclaw-listen-mode';
-
-const plugin = new ListenModePlugin();
-// or with custom config:
-const plugin = new ListenModePlugin({
-  silenceTimeoutMs: 20000,
-  maxListenTimeMs: 300000,  // 5min silence exit
-  completenessCheck: {
-    enabled: true,           // LLM completeness check (default: on)
-  },
-});
-```
-
-## How It Works
-
-### Trigger → Listen → Respond → Stay
-
-```
-User says "听我说" (trigger phrase)
-  → AI: "我在，你说 🫶" (entry ack)
-  → Enter LISTENING mode
-
-User sends messages...
-  → Buffer all messages
-  → Send emotion-aware acks every 5-7 messages
-  → Dynamic silence timer resets on each message
-
-User stops typing...
-  → Silence timer fires (7-30s dynamic)
-  → LLM completeness check: "User finished?" 
-    → No → extend 7s, check again (max 2x)
-    → Yes → merge buffer → send to AI agent
-  → AI responds comprehensively
-  → Stay in LISTENING mode (wait for more)
-
-User says "不聊了" (exit phrase)
-  → AI: "好嘞，随时来找我" (farewell)
-  → Exit to NORMAL mode
-
--- OR --
-
-5 minutes of silence after last message
-  → AI: "我先在这等你哈，回来了随时继续说 ☺️"
-  → Exit to NORMAL mode
-```
-
-### Dynamic Silence Timeout
-
-The silence timeout adapts to the user's behavior in real-time:
-
-```
-timeout = (base + lengthBonus + voiceBonus) × punctuation × trend
-```
-
-| Layer | Rule | Effect |
-|-------|------|--------|
-| Base | 7 seconds | Default wait time |
-| Length | Message > 30 chars | +5s bonus |
-| Voice | Last message is voice | +15s bonus |
-| Punctuation | `？` question mark | ×0.3 (respond fast) |
-| | `。` period | ×0.5 (sentence done) |
-| | `...` `，` ellipsis/comma | ×1.5 (still thinking) |
-| Trend | Typing faster | ×1.3 (wait longer) |
-| | Typing slower | ×0.7 (almost done) |
-
-Clamped to **[2s, 30s]**.
-
-### LLM Completeness Check
-
-When the silence timer fires, instead of responding immediately:
-
-```
-Timer fires → LLM: "Has user finished their thought?"
-  → {"done": false} → extend 7s, try again (max 2 extensions)
-  → {"done": true}  → trigger response
-  → LLM error       → fallback to immediate response
-```
-
-Cost: ~140 tokens per check, max 2 checks per round. Negligible.
+The plugin is automatically discovered by OpenClaw when placed in `~/.openclaw/extensions/listen-mode/`.
 
 ## Configuration
 
-All options with defaults:
+Zero configuration required. The plugin reads LLM provider settings from OpenClaw's `openclaw.json`:
 
-```typescript
-{
-  // Trigger
-  triggerMode: 'both',           // 'manual' | 'auto' | 'both'
-  sensitivity: 'high',           // 'low' | 'medium' | 'high'
-  languages: ['zh', 'en'],
+- **Model/Provider**: Uses the first configured provider (e.g., MiniMax, OpenAI, Anthropic)
+- **Bot Token**: Reads from `channels.telegram.botToken` for Telegram delivery
+- **Session**: Automatically resolves from OpenClaw's session store
 
-  // Timing
-  silenceTimeoutMs: 20000,       // Base silence timeout (dynamic overrides this)
-  maxListenTimeMs: 300000,       // 5min silence → exit
-  maxBufferMessages: 20,         // Max messages before forced response
+### Tunable Constants
 
-  // Acknowledgments
-  ack: {
-    entryReply: true,            // Send "我在，你说" on enter
-    intervalMessages: [5, 7],    // Ack every 5-7 messages
-    useLLM: true,                // Use LLM for contextual acks
-    llmModel: 'haiku',           // Cheap model for acks
-  },
-
-  // Reply splitting (for WeChat multi-bubble)
-  reply: {
-    splitEnabled: true,
-    maxCharsPerMessage: 50,
-    delayBaseMs: 1500,           // Human-like typing delay
-  },
-
-  // Intelligence
-  intelligence: {
-    intentClassification: true,   // LLM intent detection
-    fallbackToKeywords: true,     // Keyword fallback if LLM fails
-  },
-
-  // Dynamic timeout
-  dynamicTimeout: {
-    enabled: true,
-    minMs: 10000,
-    maxMs: 30000,
-    voiceExtraMs: 15000,
-  },
-
-  // LLM completeness check
-  completenessCheck: {
-    enabled: true,
-    model: 'auto',               // Use gateway default model
-    timeoutMs: 1500,
-    maxExtensions: 2,            // Max 2 extensions (2×7s = 14s extra)
-    extensionMs: 7000,           // 7s per extension
-  },
-
-  // Persona
-  persona: {
-    default: 'warm-friend',
-    allowSwitch: true,
-  },
-
-  // Session
-  session: {
-    enabled: true,
-    maxDurationMs: 600000,       // 10min session cap
-    maxRounds: 5,
-  },
-}
+```javascript
+DEBOUNCE_MS = 2000        // Debounce window (ms)
+WAIT_EXTEND_MS = 3000     // Extra wait when judge returns WAIT (ms)
+JUDGE_TIMEOUT_MS = 3000   // Judge LLM call timeout (ms)
+SKIP_JUDGE_CHARS = 5      // Skip judge for single messages <= this length
 ```
 
-## Project Structure
+## How It Works (Under the Hood)
 
-```
-src/
-├── ack/                    # Acknowledgment system
-│   ├── emotion-category.ts   # 6-category emotion classifier
-│   ├── entry-responder.ts    # Entry/exit/farewell messages
-│   ├── fallback-pool.ts      # Emotion-specific ack pools
-│   ├── interim-responder.ts  # Mid-listen ack logic
-│   └── llm-ack-generator.ts  # LLM-powered contextual acks
-├── config/                 # Configuration
-│   ├── defaults.ts           # Default values
-│   ├── merger.ts             # Deep merge user config
-│   └── schema.ts             # Zod validation
-├── core/                   # Core logic
-│   ├── state-machine.ts      # Main state machine (NORMAL/LISTENING/RESPONDING)
-│   ├── dynamic-timeout.ts    # 4-layer dynamic silence timeout
-│   ├── completeness-checker.ts # LLM "user finished?" check
-│   ├── exit-detector.ts      # Exit condition detection
-│   ├── intent-classifier.ts  # LLM intent classification
-│   ├── emotion-scorer.ts     # Emotion intensity scoring
-│   ├── message-buffer.ts     # Per-user message buffering
-│   ├── message-merger.ts     # Buffer → single prompt
-│   ├── persona.ts            # Persona management
-│   ├── listen-session.ts     # Multi-round session tracking
-│   └── analytics.ts          # Session analytics events
-├── delivery/               # Message delivery
-│   ├── reply-splitter.ts     # <<<SPLIT>>> handling
-│   ├── delivery-queue.ts     # Ordered delivery with delays
-│   └── delay-calculator.ts   # Human-like typing delays
-├── i18n/                   # Internationalization
-│   ├── keywords-zh.ts        # Chinese triggers/exits/tasks
-│   ├── keywords-en.ts        # English triggers/exits/tasks
-│   └── responses.ts          # Ack/farewell response pools
-├── types/                  # TypeScript types
-└── plugin.ts               # Plugin entry point
-```
+1. **`api.on('before_dispatch')`** — OpenClaw hook that fires for every incoming message. Returns `{ handled: true }` to prevent default processing.
+
+2. **`runEmbeddedPiAgent`** — OpenClaw's internal API that runs the full agent pipeline: session history loading, memory recall, prompt building, LLM call, memory capture, and response generation. This ensures the AI has full conversation context and long-term memory.
+
+3. **Session Resolution** — The plugin reads `~/.openclaw/agents/main/sessions/sessions.json` to map session keys to UUIDs, then passes the correct session file path to `runEmbeddedPiAgent`.
+
+4. **Reply Delivery** — Primary: `runEmbeddedPiAgent`'s internal message tool sends replies directly. Fallback: If the agent didn't send, the plugin uses the channel's Bot API.
+
+5. **Semantic Judge** — A lightweight LLM call with a specialized prompt that outputs only `DONE` or `WAIT`. Runs in parallel with the debounce timer. The result is extracted from the model's thinking content (for models like MiniMax that output thinking first).
+
+## Version History
+
+| Version | Changes |
+|---------|---------|
+| 2.0.1 | Fix duplicate replies (agent message tool + Bot API double-send) |
+| 2.0.0 | v3: Semantic judge + runEmbeddedPiAgent + channel-agnostic + dedup |
+| 1.0.0 | Instant response + abort-on-new-message |
+| 0.5.0 | Debounce + abort mode |
+| 0.4.x | api.on() hook discovery, bridgedChannels |
+| 0.3.x | LLM completeness check, silence-based exit |
+| 0.2.x | Dynamic timeout v2, emotion-aware acks |
 
 ## Testing
 
