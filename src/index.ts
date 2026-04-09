@@ -1,12 +1,15 @@
 export { ListenModePlugin } from './plugin.js';
 
-// OpenClaw plugin entry point
+// OpenClaw plugin entry point — uses correct (event, ctx) hook signatures
 import { ListenModePlugin } from './plugin.js';
 import type { InboundMessage } from './types/message.js';
+import type { GatewayContext } from './types/plugin-api.js';
+
+// ─── Types matching OpenClaw Plugin SDK ───
 
 interface PluginApi {
   registrationMode: string;
-  pluginConfig: Record<string, unknown>;
+  pluginConfig?: Record<string, unknown>;
   config: Record<string, unknown>;
   logger: {
     info: (...args: unknown[]) => void;
@@ -14,11 +17,47 @@ interface PluginApi {
     error: (...args: unknown[]) => void;
     debug: (...args: unknown[]) => void;
   };
-  registerHook: (events: string, handler: (...args: any[]) => any, opts?: { name?: string; description?: string }) => void;
-  registerTool: (...args: any[]) => void;
-  on: (event: string, handler: (...args: any[]) => any, opts?: { name?: string }) => void;
+  runtime: {
+    sendMessage?: (to: string, text: string, opts?: Record<string, unknown>) => Promise<void>;
+    callLLM?: (prompt: string, opts?: Record<string, unknown>) => Promise<string>;
+    dispatchToAgent?: (sessionKey: string, content: string) => Promise<string>;
+    [key: string]: unknown;
+  };
+  // api.on() is the correct hook registration method (not registerHook)
+  on: (event: string, handler: (...args: any[]) => any) => void;
+  registerHook?: (events: string | string[], handler: (...args: any[]) => any, opts?: Record<string, unknown>) => void;
   [key: string]: unknown;
 }
+
+// OpenClaw Hook event types (from plugin-sdk/src/plugins/types.d.ts)
+interface BeforeDispatchEvent {
+  content: string;
+  body?: string;
+  channel?: string;
+  sessionKey?: string;
+  senderId?: string;
+  isGroup?: boolean;
+  timestamp?: number;
+}
+
+interface BeforeAgentReplyEvent {
+  cleanedBody: string;
+}
+
+interface MessageSendingEvent {
+  to: string;
+  content: string;
+}
+
+interface HookContext {
+  channelId?: string;
+  accountId?: string;
+  conversationId?: string;
+  sessionKey?: string;
+  senderId?: string;
+}
+
+// ─── Plugin Entry ───
 
 // Default export for OpenClaw full-mode loading
 export default function (api: PluginApi): void {
@@ -28,113 +67,108 @@ export default function (api: PluginApi): void {
   const plugin = new ListenModePlugin(pluginConfig as any);
   let initialized = false;
 
-  const ensureInit = async (ctx: any): Promise<void> => {
-    if (!initialized) {
-      const gatewayCtx = {
-        sendToUser: ctx.sendText?.bind(ctx) ?? ctx.reply?.bind(ctx) ?? (async (_id: string, content: string) => {
-          api.logger.warn('listen-mode: no sendText/reply available, message lost:', content);
-        }),
-        sendToAgent: async (_senderId: string, content: string) => content,
-        callLLM: ctx.callLLM?.bind(ctx) ?? (async () => ''),
-        logger: api.logger,
-      };
-      await plugin.init(gatewayCtx as any);
-      initialized = true;
-      api.logger.info('listen-mode: initialized on first message');
-    }
+  // Track senderId → sessionKey for routing sendToUser/sendToAgent
+  const senderSessions = new Map<string, string>();
+
+  const ensureInit = (): void => {
+    if (initialized) return;
+
+    const gatewayCtx: GatewayContext = {
+      sendToUser: async (senderId: string, content: string) => {
+        if (api.runtime?.sendMessage) {
+          await api.runtime.sendMessage(senderId, content);
+          return;
+        }
+        api.logger.warn('listen-mode: sendToUser — no runtime.sendMessage, message lost:', content);
+      },
+      sendToAgent: async (senderId: string, content: string) => {
+        const sessionKey = senderSessions.get(senderId) ?? senderId;
+        if (api.runtime?.dispatchToAgent) {
+          return await api.runtime.dispatchToAgent(sessionKey, content);
+        }
+        api.logger.warn('listen-mode: sendToAgent — no runtime.dispatchToAgent, returning as-is');
+        return content;
+      },
+      callLLM: async (prompt: string, opts?: Record<string, unknown>) => {
+        if (api.runtime?.callLLM) {
+          return await api.runtime.callLLM(prompt, opts);
+        }
+        api.logger.warn('listen-mode: callLLM — not available');
+        return '';
+      },
+      logger: api.logger,
+    };
+
+    plugin.init(gatewayCtx);
+    initialized = true;
+    api.logger.info('listen-mode: initialized');
   };
 
-  const buildMessage = (ctx: any): InboundMessage => ({
-    id: ctx.message?.id ?? `msg-${Date.now()}`,
-    senderId: ctx.session?.contactId ?? ctx.message?.from ?? 'unknown',
-    content: ctx.message?.text ?? ctx.message?.content ?? '',
-    timestamp: ctx.message?.timestamp ?? Date.now(),
+  const buildMessage = (event: { content?: string; senderId?: string; isGroup?: boolean; timestamp?: number }, ctx?: HookContext): InboundMessage => ({
+    id: `msg-${Date.now()}`,
+    senderId: event.senderId ?? ctx?.senderId ?? 'unknown',
+    content: event.content ?? '',
+    timestamp: event.timestamp ?? Date.now(),
     type: 'text',
-    groupId: ctx.session?.groupId ?? ctx.message?.groupId,
-    mentionsBot: ctx.message?.mentionsBot ?? true,
+    groupId: undefined,
+    mentionsBot: true,
   });
 
-  // Hook: before_dispatch — claiming hook, fires before model dispatch for ALL messages
-  // "First handler returning { handled: true } wins"
-  api.registerHook('before_dispatch', async (ctx: any) => {
-    api.logger.info('listen-mode: before_dispatch fired');
-    await ensureInit(ctx);
-    const message = buildMessage(ctx);
+  // Use api.on() — the correct OpenClaw hook registration method
+  const on = api.on?.bind(api);
+  if (!on) {
+    api.logger.error('listen-mode: api.on() not available, cannot register hooks');
+    return;
+  }
+
+  // ─── Layer 1: before_dispatch — intercept message before agent dispatch ───
+  on('before_dispatch', async (event: BeforeDispatchEvent, ctx: HookContext) => {
+    api.logger.info(`listen-mode: before_dispatch, content="${(event.content ?? '').slice(0, 30)}"`);
+    ensureInit();
+
+    const senderId = event.senderId ?? ctx?.senderId ?? 'unknown';
+    if (event.sessionKey) senderSessions.set(senderId, event.sessionKey);
+    if (ctx?.sessionKey) senderSessions.set(senderId, ctx.sessionKey);
+
+    const message = buildMessage(event, ctx);
     const result = await plugin.onInboundMessage(message);
     if (result === 'handled') {
-      api.logger.info('listen-mode: claimed turn via before_dispatch');
+      api.logger.info(`listen-mode: CLAIMED via before_dispatch for ${senderId}`);
       return { handled: true };
     }
     return undefined;
-  }, {
-    name: 'listen-mode.before-dispatch',
-    description: 'Intercepts messages for empathic listen mode before dispatch',
   });
 
-  // Hook: before_agent_reply — claiming hook, fires before agent reply
-  api.registerHook('before_agent_reply', async (ctx: any) => {
-    api.logger.info('listen-mode: before_agent_reply fired');
-    await ensureInit(ctx);
-    const message = buildMessage(ctx);
+  // ─── Layer 2: before_agent_reply — backup if dispatch wasn't blocked ───
+  on('before_agent_reply', async (event: BeforeAgentReplyEvent, ctx: HookContext) => {
+    ensureInit();
+
+    // Only block if plugin is in LISTENING state for this sender
+    const senderId = ctx?.senderId ?? 'unknown';
+    const message = buildMessage({ content: event.cleanedBody, senderId }, ctx);
     const result = await plugin.onInboundMessage(message);
     if (result === 'handled') {
-      api.logger.info('listen-mode: claimed turn via before_agent_reply');
-      return { handled: true };
+      api.logger.info(`listen-mode: BLOCKED agent reply for ${senderId}`);
+      return { handled: true, reason: 'listen-mode active' };
     }
     return undefined;
-  }, {
-    name: 'listen-mode.before-agent-reply',
-    description: 'Intercepts messages before agent replies for listen mode',
   });
 
-  // Hook: inbound_claim — for plugin-owned bindings
-  api.registerHook('inbound_claim', async (ctx: any) => {
-    api.logger.info('listen-mode: inbound_claim fired');
-    await ensureInit(ctx);
-    const message = buildMessage(ctx);
-    const result = await plugin.onInboundMessage(message);
-    if (result === 'handled') {
-      return { handled: true };
-    }
-    return undefined;
-  }, {
-    name: 'listen-mode.inbound-claim',
-    description: 'Claims inbound messages for listen mode',
-  });
-
-  // Hook: message_received — fire-and-forget, for logging/state tracking
-  api.registerHook('message_received', async (_ctx: any) => {
-    api.logger.info('listen-mode: message_received fired');
-  }, {
-    name: 'listen-mode.message-received',
-    description: 'Tracks received messages for listen mode state',
-  });
-
-  // Hook: intercept outbound messages for splitting
-  api.registerHook('message_sending', async (ctx: any) => {
+  // ─── message_sending — intercept outbound for reply splitting ───
+  on('message_sending', async (event: MessageSendingEvent, _ctx: HookContext) => {
     const outbound = {
-      senderId: ctx.session?.contactId ?? 'unknown',
-      content: ctx.message?.text ?? ctx.message?.content ?? '',
+      senderId: event.to ?? 'unknown',
+      content: event.content ?? '',
       type: 'text' as const,
     };
     const result = await plugin.onOutboundMessage(outbound);
     if (Array.isArray(result)) {
-      for (const msg of result) {
-        if (msg.type === 'sticker') {
-          await ctx.sendSticker?.(msg.stickerCategory);
-        } else {
-          await ctx.sendText?.(msg.content);
-        }
-      }
-      return { cancel: true };
+      return { content: result.map((m: any) => m.content).join('\n') };
     }
     return undefined;
-  }, {
-    name: 'listen-mode.message-sending',
-    description: 'Splits outbound messages for natural chat delivery',
   });
 
-  api.logger.info('listen-mode: all hooks registered');
+  api.logger.info('listen-mode: hooks registered via api.on() (before_dispatch + before_agent_reply)');
 }
 
 export type {
