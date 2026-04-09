@@ -212,8 +212,9 @@ ${bufferText}`;
       state.abortController = null;
       state.state = 'idle';
 
-      // Send via Telegram Bot API
-      if (replyText && botToken) {
+      // Agent sends via message tool (multi-bubble). Only Bot API fallback if agent didn't send.
+      const agentSent = result?.didSendViaMessagingTool || (sentTexts.length > 0);
+      if (!agentSent && replyText && botToken) {
         await fetch('https://api.telegram.org/bot' + botToken + '/sendMessage', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
