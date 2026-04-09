@@ -121,8 +121,17 @@ export default function (api: PluginApi): void {
     return;
   }
 
+  // Channels that have their own bridge (e.g. openclaw-weixin with listen-mode-bridge.ts)
+  // should be skipped — the bridge handles listen mode directly via processOneMessage.
+  const bridgedChannels = new Set(['openclaw-weixin']);
+
   // ─── Layer 1: before_dispatch — intercept message before agent dispatch ───
   on('before_dispatch', async (event: BeforeDispatchEvent, ctx: HookContext) => {
+    // Skip channels that have their own bridge
+    if (event.channel && bridgedChannels.has(event.channel)) {
+      return undefined;
+    }
+
     api.logger.info(`listen-mode: before_dispatch, content="${(event.content ?? '').slice(0, 30)}"`);
     ensureInit();
 
@@ -141,9 +150,13 @@ export default function (api: PluginApi): void {
 
   // ─── Layer 2: before_agent_reply — backup if dispatch wasn't blocked ───
   on('before_agent_reply', async (event: BeforeAgentReplyEvent, ctx: HookContext) => {
+    // Skip bridged channels
+    if (ctx?.channelId && bridgedChannels.has(ctx.channelId)) {
+      return undefined;
+    }
+
     ensureInit();
 
-    // Only block if plugin is in LISTENING state for this sender
     const senderId = ctx?.senderId ?? 'unknown';
     const message = buildMessage({ content: event.cleanedBody, senderId }, ctx);
     const result = await plugin.onInboundMessage(message);
