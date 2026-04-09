@@ -279,6 +279,11 @@ ${bufferText}`;
     const content = event.content ?? '';
     const senderId = event.senderId ?? ctx?.senderId ?? 'unknown';
 
+    // Skip non-Telegram channels (WeChat routing via runEmbeddedPiAgent not solved yet)
+    if (event.channel && event.channel !== 'telegram') {
+      return undefined;
+    }
+
     let state = senderState.get(senderId);
     if (!state) {
       state = { messages: [], timer: null, abortController: null, judgeAbort: null, state: 'idle' };
