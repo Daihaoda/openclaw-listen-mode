@@ -1,6 +1,6 @@
 {
   "name": "@im_dd/openclaw-listen-mode",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "OpenClaw plugin that buffers rapid messages and responds once with full context — currently supports Telegram",
   "type": "module",
   "main": "dist/index.js",
