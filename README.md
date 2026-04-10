@@ -88,12 +88,12 @@ Skips identical consecutive messages from the same sender (OpenClaw's Telegram p
 
 | Platform | Intercept | AI Pipeline | Reply Delivery | Status |
 |----------|-----------|-------------|----------------|--------|
-| Telegram | api.on('before_dispatch') | runEmbeddedPiAgent | message tool + Bot API fallback | Verified |
-| WeChat | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Architecture ready |
-| Discord | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Architecture ready |
-| Slack | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Architecture ready |
+| **Telegram** | api.on('before_dispatch') | runEmbeddedPiAgent | message tool + Bot API fallback | **Supported** |
+| WeChat | api.on('before_dispatch') | runEmbeddedPiAgent | Blocked by channel routing | Not yet |
+| Discord | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Not yet |
+| Slack | api.on('before_dispatch') | runEmbeddedPiAgent | Pending adapter | Not yet |
 
-The core logic is platform-agnostic. Only the reply delivery step needs per-channel adaptation.
+**Currently only Telegram is fully supported.** Other channels pass through to OpenClaw's default handling. The core intercept + buffer + judge logic is platform-agnostic; the blocker for other channels is reply delivery routing (`runEmbeddedPiAgent`'s message tool routes by session origin, not by the current message's channel).
 
 ## Performance
 

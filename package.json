@@ -1,7 +1,7 @@
 {
   "name": "@im_dd/openclaw-listen-mode",
   "version": "2.0.4",
-  "description": "OpenClaw plugin that buffers rapid messages and responds once with full context — supports Telegram, WeChat, and more",
+  "description": "OpenClaw plugin that buffers rapid messages and responds once with full context — currently supports Telegram",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -26,10 +26,9 @@
     "openclaw",
     "plugin",
     "listen-mode",
-    "empathy",
     "telegram",
-    "wechat",
     "chat",
+    "message-buffer",
     "debounce",
     "semantic-judge"
   ],

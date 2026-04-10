@@ -279,9 +279,9 @@ ${bufferText}`;
     const content = event.content ?? '';
     const senderId = event.senderId ?? ctx?.senderId ?? 'unknown';
 
-    // Skip non-Telegram channels (WeChat routing via runEmbeddedPiAgent not solved yet)
+    // Currently only Telegram is supported (WeChat channel routing not yet resolved)
     if (event.channel && event.channel !== 'telegram') {
-      return undefined;
+      return undefined; // passthrough to OpenClaw default handling
     }
 
     let state = senderState.get(senderId);
